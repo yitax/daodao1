@@ -17,7 +17,7 @@ const Settings = () => import('../views/Settings.vue')
 const PersonalitySettings = () => import('../views/settings/PersonalitySettings.vue')
 const AccountSettings = () => import('../views/settings/AccountSettings.vue')
 const ManualEntry = () => import('../views/ManualEntry.vue')
-
+const BatchImport = () => import('../views/BatchImport.vue')
 const routes = [
     {
         path: '/',
@@ -37,6 +37,12 @@ const routes = [
                 name: 'manual',
                 component: ManualEntry,
                 meta: { title: '手动记账' }
+            },
+            {
+                path: 'batch',
+                name: 'batch',
+                component: BatchImport,
+                meta: { title: '批量导入' }
             },
             {
                 path: 'reports',

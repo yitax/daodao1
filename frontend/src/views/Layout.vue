@@ -23,7 +23,12 @@
               <el-icon><EditPen /></el-icon>
               <span>手动记账</span>
             </el-menu-item>
-            
+
+            <el-menu-item index="/batch">
+               <el-icon><Upload /></el-icon>
+               <span>批量导入</span>
+            </el-menu-item>
+
             <el-sub-menu index="/reports">
               <template #title>
                 <el-icon><DataAnalysis /></el-icon>
@@ -122,7 +127,7 @@ import {
   User,
   ArrowDown,
   EditPen,
-  Operation
+  Operation, Upload
 } from '@element-plus/icons-vue';
 
 const router = useRouter();

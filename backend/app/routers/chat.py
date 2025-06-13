@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form, Body
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
@@ -713,3 +716,333 @@ async def recognize_image(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"处理图片失败: {str(e)}",
         )
+
+
+
+
+@router.post("/batch-import", response_model=Dict[str, Any])
+async def process_excel(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    接收用户上传的EXCEL表格，提取交易信息
+    """
+    print("\n\n========= 接收到EXCEL处理请求 =========")
+    print(f"用户: {current_user.username}")
+    print(f"文件名: {file.filename}")
+
+    try:
+        # 创建临时目录存储上传的文档
+        temp_dir = os.path.join("temp", "uploads")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # 生成唯一文件名
+        file_extension = os.path.splitext(file.filename)[1]
+        temp_file_name = f"{uuid.uuid4()}{file_extension}"
+        temp_file_path = os.path.join(temp_dir, temp_file_name)
+
+        # 保存上传的EXCEL文件
+        print(f"保存文件到临时路径: {temp_file_path}")
+        with open(temp_file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        #将EXCEL文件转换为文本，用于AI处理
+        file_content = read_file_batch(temp_file_path)
+
+        print(f"成功读取文件内容，长度: {len(file_content)}字符")
+
+        print("调用AI API识别文件的交易信息...")
+        max_len_limit = 6000  # 每次API调用的最大字符数，太长AI返回信息会被截断
+        all_extracted_data = []  # 存储所有提取的数据
+
+        # 分块处理文件内容
+        for i in range(0, len(file_content), max_len_limit):
+            start_chunk = max(i-20,0) #max_len_limit会截断EXCEL信息，所以设置一个20字符的缓冲区
+            end_chunk = min(i+max_len_limit, len(file_content))
+            chunk = file_content[start_chunk:end_chunk]
+            print(f"正在处理第 {i // max_len_limit + 1} 块内容，长度: {len(chunk)}字符")
+            try:
+                # 构建提示词
+                prompt = """
+                    # 指令说明
+                    请严格按以下步骤处理输入文件：
+                    --- 第一步：文件类型验证 ---
+                    1. 若输入文件明显不是财务类数据（如纯文本、图片描述等），直接返回：[]，注意不是返回[]```
+                    --- 第二步：数据提取规则 ---
+                    2. 仅当确认是财务数据时，按以下规则提取：
+                    交易类型(type):
+                        必须为 "income"(收入) 或 "expense"(支出)
+                    金额(amount):
+                        必须为数字（允许小数）
+                        金额前带符号的需自动修正（如"-15" → 15，"+"可保留）
+                    日期(date):
+                        格式必须为 YYYY-MM-DD
+                        原始格式为"20250509"需转为"2025-05-09"
+                    时间(time):
+                        格式必须为 HH:MM（24小时制）
+                        缺失时可设为 "00:00"
+                    分类(category):
+                        从预定义列表选择：[餐饮美食, 交通出行, 服饰美容, 日用百货, 住房物业, 医疗健康, 文教娱乐, 
+                            人情往来, 工资薪酬, 投资理财, 奖金, 退款, 兼职收入, 租金收入, 礼金收入, 中奖收入, 
+                            意外所得, 其他收入, 其他支出, 未分类]  
+                        无法归类时设为 null
+                    --- 第三步：输出规范 ---
+                    3. 请直接输出纯JSON格式，不要包含任何Markdown代码块符号或额外说明，示例：
+                    [
+                      {
+                        "type": "expense",
+                        "amount": 14.00,
+                        "date": "2025-06-09",
+                        "time": "12:38",
+                        "description": "东三港式烧腊25",
+                        "category": "餐饮美食"
+                      },
+                      {
+                        "type": "income",
+                        "amount": 9.5,
+                        "date": "2025-06-05",
+                        "time": "12:23",
+                        "description": "二维码收款",
+                        "category": null
+                      }
+                    ]
+                    4.错误示例:```json
+                """
+                response = openai.ChatCompletion.create(
+                    model=os.getenv('AI_MODEL'),
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "你是一个专业的交易凭证识别助手，擅长从文件中提取财务信息。",
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "text", "text": chunk}
+                            ],
+                        },
+                    ],
+                    temperature=0.1,
+                    stream=False,
+                    top_p=0.7
+                )
+                print(f"第 {i // max_len_limit + 1} 块API调用成功!")
+                result = response.choices[0].message.content
+                print(f"第 {i // max_len_limit + 1} 块API原始返回: {result}")
+                print("---------------------------------")
+
+                # 解析JSON响应
+                try:
+                    # 尝试去除 Markdown 代码块标记
+                    cleaned_result = re.sub(r'```(?:json)?\n?|\n```', '', result).strip()
+                    extracted_data = json.loads(cleaned_result )
+                    if not isinstance(extracted_data, list):
+                        print(f"第 {i // max_len_limit + 1} 块返回数据不是有效的列表格式")
+                        continue
+
+                    all_extracted_data.extend(extracted_data)
+                    print(f"第 {i // max_len_limit + 1} 块成功提取{len(extracted_data)}条交易记录")
+
+                except Exception as e:
+                    print(f"第 {i // max_len_limit + 1} 块解析JSON响应时出错: {str(e)}")
+                    continue
+
+            except Exception as e:
+                print(f"第 {i // max_len_limit + 1} 块API调用失败: {str(e)}")
+                continue
+
+        # 处理最终结果
+        if not all_extracted_data:
+            ai_message = "未能从文件中识别出有效的交易记录，请检查文件内容或尝试其他文件。"
+        else:
+            # 生成AI响应消息
+            ai_message = (
+                f"我已从文件中识别出{len(all_extracted_data)}条交易记录。"
+            )
+
+        # 保存AI消息到数据库
+        # db_ai_message = ChatMessage(
+        #     user_id=current_user.id,
+        #     content=ai_message,
+        #     is_user=False,
+        # )
+        # db.add(db_ai_message)
+        # db.commit()
+        # db.refresh(db_ai_message)
+
+        # 删除临时文件
+        os.remove(temp_file_path)
+
+        print(f"文件识别完成，共提取 {len(all_extracted_data)} 条交易信息")
+        return {
+            "message": ai_message,
+            "extracted_info": all_extracted_data,
+            "needs_confirmation": True,
+        }
+
+    except Exception as e:
+        print(f"处理文件上传请求时出错: {str(e)}")
+        import traceback
+
+        print(f"错误堆栈:\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"处理文件失败: {str(e)}",
+        )
+
+
+@router.post("/batch-confirm", response_model=Dict[str, Any])
+async def batch_import(
+    request_data: Dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    批量确认并导入交易记录
+    """
+    print("\n\n========= 接收到批量确认请求 =========")
+    print(f"请求数据条数: {len(request_data.get('transactions', []))}")
+
+    try:
+        # 验证请求数据
+        if not request_data.get("confirmed", False):
+            return {
+                "message": "批量导入未确认",
+                "imported_count": 0,
+                "skipped_count": 0,
+                "results": []
+            }
+
+        transactions = request_data.get("transactions", [])
+        if not transactions:
+            return {
+                "message": "没有可导入的交易记录",
+                "imported_count": 0,
+                "skipped_count": 0,
+                "results": []
+            }
+
+        imported_count = 0
+        skipped_count = 0
+        results = []
+        batch_errors = []
+
+        # 使用事务处理批量导入
+        try:
+            for idx, transaction_data in enumerate(transactions, start=1):
+                try:
+                    # 数据预处理
+                    processed_data = {
+                        "message_id": -1,  # 批量导入特殊标识
+                        "confirm": True,
+                        "type": (transaction_data.get("type") or "").lower(),
+                        "amount": float(transaction_data.get("amount", 0)),
+                        "description": transaction_data.get("description", ""),
+                        "category": transaction_data.get("category", "未分类"),
+                        "date": transaction_data.get("date"),
+                        "time": transaction_data.get("time", "00:00")
+                    }
+                    # 日期格式处理
+                    if processed_data["date"] and "T" in processed_data["date"]:
+                        processed_data["date"] = processed_data["date"].split("T")[0]
+                    # 验证必填字段
+                    if processed_data["amount"] <= 0:
+                        raise ValueError("金额无效")
+                    # 创建确认对象
+                    confirmation = TransactionConfirmation(**processed_data)
+                    # 调用单条确认接口
+                    result = confirm_transaction(confirmation, db, current_user)
+
+                    if result["confirmed"]:
+                        imported_count += 1
+                        results.append({
+                            "status": "success",
+                            "transaction_id": result["transaction"]["id"],
+                            "data": transaction_data,
+                            "message": "导入成功"
+                        })
+                    else:
+                        skipped_count += 1
+                        results.append({
+                            "status": "skipped",
+                            "data": transaction_data,
+                            "message": "交易未确认"
+                        })
+                except Exception as e:
+                    skipped_count += 1
+                    error_msg = f"第{idx}条记录错误: {str(e)}"
+                    results.append({
+                        "status": "failed",
+                        "data": transaction_data,
+                        "message": error_msg
+                    })
+                    batch_errors.append(error_msg)
+                    print(f"跳过无效记录: {error_msg}")
+
+            db.commit()  # 提交整个批量事务
+
+        except Exception as e:
+            db.rollback()  # 出错时回滚
+            raise HTTPException(
+                status_code=400,
+                detail=f"批量导入过程中出错: {str(e)}"
+            )
+        # 构建响应
+        response = {
+            "message": f"批量导入完成，成功导入{imported_count}条，跳过{skipped_count}条",
+            "imported_count": imported_count,
+            "skipped_count": skipped_count,
+            "results": results
+        }
+
+        if batch_errors:
+            response["batch_errors"] = batch_errors[:10]  # 最多返回10条错误
+
+        print(f"批量导入结果: {response['message']}")
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"批量导入过程中出错: {str(e)}")
+        import traceback
+        print(f"错误堆栈:\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"批量导入失败: {str(e)}"
+        )
+
+
+import os
+import re
+import pandas as pd
+def read_file_batch(file_path):
+    """
+    读取文件并转换为AI处理所需的标准化文本格式
+    返回: 纯文本字符串 (CSV格式)
+    """
+    _, ext = os.path.splitext(file_path)
+    ext = ext.lower()
+    if ext in ['.txt', '.csv', '.log']:
+        # 文本文件，尝试多种编码
+        encodings = ['utf-8-sig', 'utf-8', 'gbk', 'gb18030']
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"无法解码文本文件 {file_path}")
+
+    elif ext in ['.xlsx', '.xls']:
+        try:
+            df = pd.read_excel(file_path)  # 读取整个Excel文件
+            return df.to_csv(index=False)
+        except Exception as e:
+            raise ValueError(f"无法读取Excel文件 {file_path}: {str(e)}")
+    else:
+        raise ValueError(f"不支持的文件类型: {ext}")
+
